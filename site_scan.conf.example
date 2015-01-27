@@ -1,0 +1,8 @@
+[ses]
+access = AKIBSECRETLNUISECRET
+secret = 2SECRETT/OoAnlxSecRet0R4OyseCRetidLUSeCRet
+#subject = Custom subject or omit this to have one generated for you
+from_addr = Site Scan <me@example.com>
+to_addrs = You User <you@example.com>, Other User <other@example.com>
+# site you want to scan is passed in as argument to this program
+# you can omit the config entirely if you're only interested in warming the cache and not getting status emails
