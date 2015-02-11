@@ -10,12 +10,14 @@ on 2015-01-27
 
 from boto import connect_ses
 from bs4 import BeautifulSoup, SoupStrainer
+from contextlib import closing
 import logging
 from multiprocessing.dummy import Pool
 import os
 import requests
 from StringIO import StringIO
 import sys
+import traceback
 import urlparse
 
 
@@ -71,32 +73,45 @@ def check_sitemap(sitemap_url):
     return urls
 
 
-def get_status(url):
-    resp = requests.get(url)
-    return url, resp.status_code
-
+def _scan_page_safety(page):
+    max_attempts = 10
+    for attempt in range(0, max_attempts):  # try 10 times to do this
+        try:
+            return scan_page(page)
+        except Exception as ex:
+            logging.error("Exception happened while scanning page %s ... attempt %s", page.url, attempt + 1)
+            if attempt == max_attempts - 1:
+                logging.error("Attempted %s times to scan %s ... not trying again :(", max_attempts, page.url)
+            logging.error(traceback.format_exc())
 
 def scan_page(page):
-    resp = SESSION.get(page.url, stream=False)
     scheme, domain, path = urlparse.urlparse(page.url)[:3]
-    base_url = "%s://%s" % (scheme, domain)
+    base_urls = [domain]
+    if domain.startswith('www.'):  # scan the non-www version of this site too
+        base_urls.append(domain[4:])
+    base_urls = tuple(base_urls)
     links = set()
-    if resp.status_code == 200 and 'text/html' in resp.headers['Content-Type'].lower():
-        soup = BeautifulSoup(resp.text, parse_only=SoupStrainer('a'))
-        for a in soup:
-            try:
-                href = a['href']
-            except KeyError:
-                continue
-            href = href.split('#', 1)[0]
-            if not href or href.startswith(('mailto:', 'tel:')):
-                continue  # not actual links to pages
-            else:
-                href = urlparse.urljoin(page.url, href)
-            if not href.startswith(base_url):
-                continue  # this is not a path on our website, do not follow
-            links.add(Page(href, source=page.url))
-    page.status = resp.status_code
+    with closing(SESSION.get(page.url, stream=True)) as resp:
+        if resp.status_code == 200 and 'text/html' in resp.headers['Content-Type'].lower():
+            soup = BeautifulSoup(resp.text, parse_only=SoupStrainer('a'))
+            logging.info('reading the response for %s as it was text/html', page.url)
+            for a in soup:
+                try:
+                    href = a['href']
+                except KeyError:
+                    continue
+                href = href.split('#', 1)[0]
+                if not href or href.startswith(('mailto:', 'tel:')):
+                    continue  # not actual links to pages
+                else:
+                    href = urlparse.urljoin(page.url, href)
+                if not href.split('://', 1)[1].startswith(base_urls):  # remove the scheme://
+                    continue  # this is not a path on our website, do not follow
+                links.add(Page(href, source=page.url))
+        else:
+            logging.info('skipped content for %s the mime type was %s and response code was %s',
+                         page.url, resp.headers['Content-Type'], resp.status_code)
+        page.status = resp.status_code
     return links
 
 
@@ -116,14 +131,15 @@ def scan_website(site_url, threads=10):
         if not remaining_urls:  # finished with the website
             break
         logging.info("URLs to Scan (%s)", len(remaining_urls))
-        scans = pool.map(scan_page, remaining_urls)
+        scans = pool.map(_scan_page_safety, remaining_urls)
         scanned_urls |= remaining_urls
         logging.info("URLs scanned (%s)", len(scanned_urls))
 
         # add links found on pages to our pool of found_urls
         for links in scans:
-            for page in links:
-                found_urls.add(page)  # adds the page for scanning if it doesn't already exist
+            if links:  # might return None if the page errored out multiple times
+                for page in links:
+                    found_urls.add(page)  # adds the page for scanning if it doesn't already exist
 
     logging.info("Finished. Scanned %s pages." % len(scanned_urls))
 
