@@ -15,14 +15,24 @@ import logging
 from multiprocessing.dummy import Pool
 import os
 import requests
-from StringIO import StringIO
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 import sys
 import traceback
-import urlparse
+try:
+    import urlparse
+except ImportError:
+    from urllib import parse as urlparse
 
 
 # get config file for emailing a user the report
-from ConfigParser import RawConfigParser, NoSectionError
+try:
+    from ConfigParser import RawConfigParser, NoSectionError
+except ImportError:
+    from configparser import RawConfigParser, NoSectionError
+
 try:
     config = RawConfigParser({'subject': None})
     config.read('site_scan.conf')
@@ -32,8 +42,8 @@ try:
     FROM_ADDR = config.get('ses', 'from_addr')
     TO_ADDRS = config.get('ses', 'to_addrs').split(',')
 except Exception as ex:
-    logging.warn('Cache warming mode! Since no suitable configuration file was found (%s), '
-                 'no email will be sent at the end.', ex.message)
+    logging.warning('Cache warming mode! Since no suitable configuration file was found (%s), no email '
+                    'will be sent at the end.', ex)
 
 SESSION = requests.Session()
 
@@ -78,11 +88,12 @@ def _scan_page_safety(page):
     for attempt in range(0, max_attempts):  # try 10 times to do this
         try:
             return scan_page(page)
-        except Exception as ex:
+        except Exception:
             logging.error("Exception happened while scanning page %s ... attempt %s", page.url, attempt + 1)
             if attempt == max_attempts - 1:
                 logging.error("Attempted %s times to scan %s ... not trying again :(", max_attempts, page.url)
             logging.error(traceback.format_exc())
+
 
 def scan_page(page):
     scheme, domain, path = urlparse.urlparse(page.url)[:3]
@@ -91,7 +102,7 @@ def scan_page(page):
         base_urls.append(domain[4:])
     base_urls = tuple(base_urls)
     links = set()
-    with closing(SESSION.get(page.url, stream=True)) as resp:
+    with closing(SESSION.get(page.url, stream=True, verify=False)) as resp:
         if resp.status_code == 200 and 'text/html' in resp.headers['Content-Type'].lower():
             soup = BeautifulSoup(resp.text, parse_only=SoupStrainer('a'))
             logging.info('reading the response for %s as it was text/html', page.url)
@@ -171,6 +182,7 @@ def scan_website(site_url, threads=10):
             subject = 'Site Check for %s' % base_url
         ses.send_email(FROM_ADDR, subject, body, TO_ADDRS)
         logging.info("Email sent.")
+
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
