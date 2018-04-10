@@ -40,5 +40,5 @@ nosetests.xml
 .idea*
 *.settings
 *.log
-/.venv/
+/.venv*/
 site_scan.conf
