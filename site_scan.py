@@ -8,42 +8,75 @@ by Phillip Stromberg
 on 2015-01-27
 """
 
-from boto import connect_ses
-from bs4 import BeautifulSoup, SoupStrainer
-from contextlib import closing
-import logging
+import boto3
+from bs4 import BeautifulSoup, SoupStrainer, FeatureNotFound
+import logging as _logging
+from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
 import os
 import requests
+from requests import adapters
+
 try:
     from StringIO import StringIO
 except ImportError:
     from io import StringIO
 import sys
 import traceback
+
 try:
     import urlparse
 except ImportError:
     from urllib import parse as urlparse
+import time
+# we're scanning our own site
+import urllib3
 
+urllib3.disable_warnings()
 
 # get config file for emailing a user the report
 try:
-    from ConfigParser import RawConfigParser, NoSectionError
+    from ConfigParser import SafeConfigParser as ConfigParser  # Python 2
 except ImportError:
-    from configparser import RawConfigParser, NoSectionError
+    from configparser import ConfigParser  # Python 3
+
+logger = _logging.getLogger("site_scan")
+logger.setLevel(_logging.INFO)
+_log_handler = _logging.StreamHandler(sys.stderr)
+_log_format = _logging.Formatter('%(levelname)s [%(asctime).19s] %(message)s')
+_log_handler.setFormatter(_log_format)
+logger.addHandler(_log_handler)
 
 try:
-    config = RawConfigParser({'subject': None})
+    import lxml
+
+    PARSER = "lxml"
+except ImportError:
+    PARSER = "html.parser"
+    logger.info("lxml wasn't available. Falling back on %s", PARSER)
+
+try:
+    config = ConfigParser({
+        'subject': None,
+        'region': 'us-east-1',
+    })
     config.read('site_scan.conf')
     SES_ACCESS = config.get('ses', 'access')
     SES_SECRET = config.get('ses', 'secret')
+    SES_REGION = config.get('ses', 'region')
     SUBJECT = config.get('ses', 'subject')
     FROM_ADDR = config.get('ses', 'from_addr')
     TO_ADDRS = config.get('ses', 'to_addrs').split(',')
 except Exception as ex:
-    logging.warning('Cache warming mode! Since no suitable configuration file was found (%s), no email '
-                    'will be sent at the end.', ex)
+    logger.warning('Cache warming mode! Since no suitable configuration file was found (%s), no email '
+                   'will be sent at the end.', ex)
+
+ses = boto3.client(
+    'ses',
+    aws_access_key_id=SES_ACCESS,
+    aws_secret_access_key=SES_SECRET,
+    region_name=SES_REGION
+)
 
 SESSION = requests.Session()
 
@@ -78,7 +111,13 @@ class Page(object):
 def check_sitemap(sitemap_url):
     """Given a URL to a sitemap, returns all the URLs contained within."""
     response = requests.get(sitemap_url)
-    soup = BeautifulSoup(response.text, parse_only=SoupStrainer('loc'))
+    soup = None
+    for parser in ["lxml-xml", "html.parser"]:
+        try:
+            soup = BeautifulSoup(response.text, parser, parse_only=SoupStrainer('loc'))
+            break
+        except FeatureNotFound:
+            logger.info("Couldn't use %s parser.", parser)
     urls = {loc.text for loc in soup}
     return urls
 
@@ -89,10 +128,10 @@ def _scan_page_safety(page):
         try:
             return scan_page(page)
         except Exception:
-            logging.error("Exception happened while scanning page %s ... attempt %s", page.url, attempt + 1)
+            logger.error("Exception happened while scanning page %s ... attempt %s", page.url, attempt + 1)
             if attempt == max_attempts - 1:
-                logging.error("Attempted %s times to scan %s ... not trying again :(", max_attempts, page.url)
-            logging.error(traceback.format_exc())
+                logger.error("Attempted %s times to scan %s ... not trying again :(", max_attempts, page.url)
+            logger.error(traceback.format_exc())
 
 
 def scan_page(page):
@@ -102,14 +141,14 @@ def scan_page(page):
         base_urls.append(domain[4:])
     base_urls = tuple(base_urls)
     links = set()
-    with closing(SESSION.get(page.url, stream=True, verify=False)) as resp:
+    with SESSION.get(page.url, stream=True, verify=False) as resp:
         if resp.status_code == 200 and 'text/html' in resp.headers['Content-Type'].lower():
-            soup = BeautifulSoup(resp.text, parse_only=SoupStrainer('a'))
-            logging.info('reading the response for %s as it was text/html', page.url)
+            soup = BeautifulSoup(resp.text, PARSER, parse_only=SoupStrainer('a'))
+            logger.info('reading the response for %s as it was text/html', page.url)
             for a in soup:
                 try:
                     href = a['href']
-                except KeyError:
+                except (KeyError, TypeError):
                     continue
                 href = href.split('#', 1)[0]
                 if not href or href.startswith(('mailto:', 'tel:')):
@@ -120,13 +159,19 @@ def scan_page(page):
                     continue  # this is not a path on our website, do not follow
                 links.add(Page(href, source=page.url))
         else:
-            logging.info('skipped content for %s the mime type was %s and response code was %s',
-                         page.url, resp.headers['Content-Type'], resp.status_code)
+            logger.info('skipped content for %s the mime type was %s and response code was %s',
+                        page.url, resp.headers['Content-Type'], resp.status_code)
         page.status = resp.status_code
     return links
 
 
-def scan_website(site_url, threads=10):
+def scan_website(site_url, threads=(cpu_count() * 2)):
+    start_time = time.time()
+    pool_size = max(adapters.DEFAULT_POOLSIZE, int(threads * 1.2))
+    logger.info("Scanning %s using %d threads and an HTTP connection pool size of %d" % (site_url, threads, pool_size))
+
+    adapter = adapters.HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    SESSION.mount("http", adapter)
     found_urls = set()
     scanned_urls = set()
     if site_url.endswith('.xml'):
@@ -141,18 +186,26 @@ def scan_website(site_url, threads=10):
         remaining_urls = found_urls - scanned_urls
         if not remaining_urls:  # finished with the website
             break
-        logging.info("URLs to Scan (%s)", len(remaining_urls))
+        logger.info("URLs to Scan (%s)", len(remaining_urls))
         scans = pool.map(_scan_page_safety, remaining_urls)
         scanned_urls |= remaining_urls
-        logging.info("URLs scanned (%s)", len(scanned_urls))
+        logger.info("URLs scanned (%s)", len(scanned_urls))
 
         # add links found on pages to our pool of found_urls
         for links in scans:
             if links:  # might return None if the page errored out multiple times
                 for page in links:
                     found_urls.add(page)  # adds the page for scanning if it doesn't already exist
-
-    logging.info("Finished. Scanned %s pages." % len(scanned_urls))
+    end_time = time.time()
+    duration = end_time - start_time
+    if duration >= 3600:
+        elapsed_time = "%.2f hours" % (duration / 3600)
+    elif duration >= 120:
+        elapsed_time = "%.2f minutes" % (duration / 60)
+    else:
+        elapsed_time = "%.2f seconds" % duration
+    result_message = "Finished. Scanned %d pages in %s." % (len(scanned_urls), elapsed_time)
+    logger.info(result_message)
 
     body = StringIO()
     base_url = '%s://%s' % urlparse.urlparse(site_url)[:2]
@@ -160,7 +213,7 @@ def scan_website(site_url, threads=10):
     errors = []
     for link in scanned_urls:
         if link.status != 200:
-            logging.warning(str(link))
+            logger.warning(str(link))
             errors.append(str(link))
 
     if errors:
@@ -168,32 +221,56 @@ def scan_website(site_url, threads=10):
         for e in errors:
             body.write(e + os.linesep)
     else:
-        body.write('No errors found! :)' + os.linesep)
+        body.write('No errors found! :)' + (os.linesep * 2))
+
+    body.write("%s%s" % (result_message, os.linesep))
 
     body = body.getvalue()
-    logging.info(body)
+    logger.info("Sending email:\n%s", body)
 
     if TO_ADDRS and TO_ADDRS != ['']:
-        logging.info("Sending email.")
-        ses = connect_ses(SES_ACCESS, SES_SECRET)
+        logger.info("Sending email.")
         if SUBJECT:
             subject = SUBJECT
         else:
             subject = 'Site Check for %s' % base_url
-        ses.send_email(FROM_ADDR, subject, body, TO_ADDRS)
-        logging.info("Email sent.")
+
+        params = {
+            "Source": FROM_ADDR,
+            "Destination": {
+                "ToAddresses": TO_ADDRS,
+            },
+            "Message": {
+                "Subject": {
+                    "Data": subject,
+                    "Charset": "UTF-8",
+                },
+                "Body": {
+                    "Text": {
+                        "Data": body,
+                        "Charset": "UTF-8",
+                    }
+                },
+            },
+        }
+        try:
+            ses.send_email(**params)
+            # ses.send_email(FROM_ADDR, subject, body, TO_ADDRS)
+            logger.info("Email sent.")
+        except Exception:
+            logger.error("Failed to send email:\n%s" % traceback.format_exc())
 
 
 if __name__ == '__main__':
-    logging.getLogger().setLevel(logging.INFO)
+
     try:
-        threads = int(sys.argv[2])
+        thread_count = int(sys.argv[2])
     except (ValueError, IndexError):
-        threads = 10
+        thread_count = cpu_count() * 2
     try:
         site_address = sys.argv[1]
     except IndexError:
-        logging.error('No argument given. Please specify the URL of the website or sitemap you wish to check.')
+        logger.error('No argument given. Please specify the URL of the website or sitemap you wish to check.')
         exit(1)
     else:
-        scan_website(site_address, threads=threads)
+        scan_website(site_address, threads=thread_count)
